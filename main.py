@@ -9,7 +9,7 @@ weights = np.array([0.25, 0.20, 0.20, 0.20, 0.15])
 # تحميل البيانات
 data = yf.download(symbols, start="2023-01-01")
 
-# ❌ لا تستخدم Adj Close
+
 data = data["Close"]
 
 # ✅ تحويل إلى returns
