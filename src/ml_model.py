@@ -74,7 +74,7 @@ class RiskPredictor:
         all_features = pd.concat(features_list, axis=1)
         
         all_features = all_features.replace([np.inf, -np.inf], np.nan)
-        all_features = all_features.fillna(method='ffill').fillna(method='bfill')
+        all_features = all_features.ffill().bfill()
         
         return all_features
     
