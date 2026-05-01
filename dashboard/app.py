@@ -71,9 +71,12 @@ def main():
     tickers_input = st.sidebar.text_area(
         "Enter Stock Tickers (one per line)",
         value="\n".join(default_tickers),
-        height=150
+        height=150,
+        help="Edit this list to add/remove stocks. For Saudi stocks, use format: 2222.SR"
     )
     tickers = [t.strip() for t in tickers_input.split('\n') if t.strip()]
+    
+    st.sidebar.info("💡 **Tip**: You can edit the tickers above directly!")
     
     period = st.sidebar.selectbox(
         "Time Period",
