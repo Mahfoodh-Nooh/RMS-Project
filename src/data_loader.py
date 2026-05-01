@@ -21,27 +21,25 @@ class DataLoader:
         period: str = '1y'
     ) -> pd.DataFrame:
         
+        kwargs = dict(auto_adjust=True, progress=False)
         if start_date is None and end_date is None:
-            data = yf.download(
-                tickers,
-                period=period,
-                auto_adjust=True,
-                threads=True,
-                progress=False
-            )
+            kwargs['period'] = period
         else:
-            data = yf.download(
-                tickers,
-                start=start_date,
-                end=end_date,
-                auto_adjust=True,
-                threads=True,
-                progress=False
-            )
-        
+            kwargs['start'] = start_date
+            kwargs['end'] = end_date
+
         if len(tickers) == 1:
-            data.columns = pd.MultiIndex.from_product([data.columns, tickers])
-        
+            data = yf.download(tickers[0], **kwargs)
+            if not data.empty:
+                if isinstance(data.columns, pd.MultiIndex):
+                    pass
+                else:
+                    data.columns = pd.MultiIndex.from_product([data.columns, tickers])
+        else:
+            data = yf.download(tickers, **kwargs)
+            if not data.empty and not isinstance(data.columns, pd.MultiIndex):
+                data.columns = pd.MultiIndex.from_product([data.columns, tickers])
+
         return data
     
     def get_close_prices(
@@ -53,14 +51,33 @@ class DataLoader:
     ) -> pd.DataFrame:
         
         data = self.fetch_stock_data(tickers, start_date, end_date, period)
-        
-        if 'Close' in data.columns.get_level_values(0):
-            close_prices = data['Close']
+
+        if data.empty:
+            return pd.DataFrame()
+
+        if isinstance(data.columns, pd.MultiIndex):
+            if 'Close' in data.columns.get_level_values(0):
+                close_prices = data['Close']
+            elif 'Adj Close' in data.columns.get_level_values(0):
+                close_prices = data['Adj Close']
+            else:
+                close_prices = data.iloc[:, :len(tickers)]
         else:
-            close_prices = data
-        
-        close_prices = close_prices.dropna()
-        
+            if 'Close' in data.columns:
+                close_prices = data[['Close']]
+                close_prices.columns = tickers
+            elif 'Adj Close' in data.columns:
+                close_prices = data[['Adj Close']]
+                close_prices.columns = tickers
+            else:
+                close_prices = data
+
+        if isinstance(close_prices, pd.Series):
+            close_prices = close_prices.to_frame()
+            close_prices.columns = tickers
+
+        close_prices = close_prices.dropna(how='all')
+
         return close_prices
     
     def get_returns(
@@ -107,14 +124,28 @@ class DataLoader:
     ) -> pd.DataFrame:
         
         data = self.fetch_stock_data(tickers, start_date, end_date, period)
-        
-        if 'Volume' in data.columns.get_level_values(0):
-            volume = data['Volume']
+
+        if data.empty:
+            return pd.DataFrame()
+
+        if isinstance(data.columns, pd.MultiIndex):
+            if 'Volume' in data.columns.get_level_values(0):
+                volume = data['Volume']
+            else:
+                return pd.DataFrame()
         else:
-            volume = data
-        
-        volume = volume.dropna()
-        
+            if 'Volume' in data.columns:
+                volume = data[['Volume']]
+                volume.columns = tickers
+            else:
+                return pd.DataFrame()
+
+        if isinstance(volume, pd.Series):
+            volume = volume.to_frame()
+            volume.columns = tickers
+
+        volume = volume.dropna(how='all')
+
         return volume
     
     def save_data(self, data: pd.DataFrame, filename: str):
