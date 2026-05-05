@@ -1,21 +1,11 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
-import sys
-import os
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
+import api_client
+from api_client import APIError
 
-from data_loader import DataLoader
-from risk_engine import RiskEngine
-from portfolio import Portfolio
-from ml_model import RiskPredictor
-from position_manager import PositionManager
-from validation_engine import SymbolUniverse, ValidationEngine
-from alerts_engine import AlertsEngine, RecommendationEngine
-from utils import format_currency, format_percentage, detect_high_correlation
 
 st.set_page_config(
     page_title="Risk Management System",
@@ -29,535 +19,424 @@ st.markdown("""
 .alert-high   { background:#fff0f0; border-left:4px solid #e53935; padding:8px 12px; border-radius:4px; margin:4px 0; }
 .alert-medium { background:#fff8e1; border-left:4px solid #fb8c00; padding:8px 12px; border-radius:4px; margin:4px 0; }
 .alert-low    { background:#f1f8e9; border-left:4px solid #43a047; padding:8px 12px; border-radius:4px; margin:4px 0; }
-.rec-high     { background:#fce4ec; border-left:4px solid #c62828; padding:8px 12px; border-radius:4px; margin:4px 0; }
-.rec-medium   { background:#e3f2fd; border-left:4px solid #1565c0; padding:8px 12px; border-radius:4px; margin:4px 0; }
-.rec-low      { background:#e8f5e9; border-left:4px solid #2e7d32; padding:8px 12px; border-radius:4px; margin:4px 0; }
 </style>
 """, unsafe_allow_html=True)
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
 
-@st.cache_data(ttl=3600)
-def load_market_data(tickers_tuple, period):
-    tickers = list(tickers_tuple)
-    loader = DataLoader(data_dir=DATA_DIR)
-    prices = loader.get_close_prices(tickers, period=period)
-    returns = loader.get_returns(tickers, period=period)
-    volume = loader.get_volume_data(tickers, period=period)
-    return prices, returns, volume
+# --------------------------------------------------------------------------- #
+# Session state helpers
+# --------------------------------------------------------------------------- #
 
-@st.cache_data
-def load_universe():
-    return SymbolUniverse(data_dir=DATA_DIR)
+def _init_session():
+    st.session_state.setdefault("token", None)
+    st.session_state.setdefault("user", None)
+    st.session_state.setdefault("selected_portfolio_id", None)
 
+
+def _is_logged_in() -> bool:
+    return bool(st.session_state.get("token"))
+
+
+def _logout():
+    st.session_state["token"] = None
+    st.session_state["user"] = None
+    st.session_state["selected_portfolio_id"] = None
+
+
+def _format_currency(value: float) -> str:
+    try:
+        return f"${value:,.2f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _format_percentage(value: float) -> str:
+    try:
+        return f"{value * 100:.2f}%"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+# --------------------------------------------------------------------------- #
+# Auth UI
+# --------------------------------------------------------------------------- #
+
+def render_auth_screen():
+    st.title("📊 Risk Management System")
+    st.markdown("##### Please sign in to continue")
+
+    if not api_client.health_check():
+        st.error("⚠️ Backend is not reachable at `http://127.0.0.1:8000`. Start the FastAPI server first.")
+        st.code("uvicorn backend.main:app --reload", language="bash")
+        st.stop()
+
+    tab_login, tab_register = st.tabs(["🔑 Login", "📝 Register"])
+
+    with tab_login:
+        with st.form("login_form"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_password")
+            submit = st.form_submit_button("Login")
+
+        if submit:
+            if not email or not password:
+                st.error("Email and password are required.")
+            else:
+                try:
+                    token = api_client.login_user(email, password)
+                    user = api_client.get_current_user(token)
+                    st.session_state["token"] = token
+                    st.session_state["user"] = user
+                    st.success(f"Welcome back, {user.get('full_name', email)}!")
+                    st.rerun()
+                except APIError as e:
+                    st.error(str(e))
+
+    with tab_register:
+        with st.form("register_form"):
+            r_email = st.text_input("Email", key="reg_email")
+            r_name = st.text_input("Full name", key="reg_name")
+            r_password = st.text_input("Password", type="password", key="reg_password")
+            r_submit = st.form_submit_button("Create account")
+
+        if r_submit:
+            if not (r_email and r_name and r_password):
+                st.error("All fields are required.")
+            else:
+                try:
+                    api_client.register_user(r_email, r_name, r_password)
+                    st.success("Account created. You can now log in.")
+                except APIError as e:
+                    st.error(str(e))
+
+
+# --------------------------------------------------------------------------- #
+# Sidebar — portfolio selector
+# --------------------------------------------------------------------------- #
 
 def render_sidebar():
-    st.sidebar.title("⚙️ Portfolio Setup")
+    token = st.session_state["token"]
+    user = st.session_state.get("user") or {}
 
-    st.sidebar.markdown("### 1. Input Mode")
-    input_mode = st.sidebar.radio(
-        "Select input method:",
-        ["Manual Selection", "Excel Upload", "Default (Demo)"],
-        index=2
-    )
+    st.sidebar.title("👤 Account")
+    st.sidebar.write(f"**{user.get('full_name', '-')}**")
+    st.sidebar.write(user.get("email", ""))
+    if st.sidebar.button("Logout"):
+        _logout()
+        st.rerun()
 
-    st.sidebar.markdown("### 2. Market & Period")
-    market_type = st.sidebar.selectbox(
-        "Market",
-        ["Saudi (Tadawul)", "Global", "Mixed"]
-    )
-    period = st.sidebar.selectbox(
-        "Analysis Period",
-        ['1mo', '3mo', '6mo', '1y', '2y'],
-        index=3
-    )
-    portfolio_value_override = st.sidebar.number_input(
-        "Portfolio Value Override ($) — leave 0 to use position values",
-        min_value=0,
-        max_value=100_000_000,
-        value=0,
-        step=10_000
-    )
+    st.sidebar.markdown("---")
+    st.sidebar.title("📁 Portfolios")
 
-    st.sidebar.markdown("### 3. Risk Settings")
+    try:
+        portfolios = api_client.list_portfolios(token)
+    except APIError as e:
+        st.sidebar.error(str(e))
+        portfolios = []
+
+    if portfolios:
+        options = {f"{p['name']} (#{p['id']})": p["id"] for p in portfolios}
+        current_label = None
+        if st.session_state["selected_portfolio_id"]:
+            for label, pid in options.items():
+                if pid == st.session_state["selected_portfolio_id"]:
+                    current_label = label
+                    break
+
+        labels = list(options.keys())
+        index = labels.index(current_label) if current_label in labels else 0
+        selected_label = st.sidebar.selectbox("Select portfolio", labels, index=index)
+        st.session_state["selected_portfolio_id"] = options[selected_label]
+    else:
+        st.sidebar.info("No portfolios yet. Create one below.")
+        st.session_state["selected_portfolio_id"] = None
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("➕ Create Portfolio")
+    with st.sidebar.form("create_portfolio_form", clear_on_submit=True):
+        new_name = st.text_input("Name")
+        new_value = st.number_input("Initial value ($)", min_value=1000.0, value=1_000_000.0, step=10_000.0)
+        new_tickers = st.text_area("Tickers (one per line)", placeholder="AAPL\nMSFT\n2222.SR")
+        new_quantities = st.text_area("Quantities (one per line, matching order)", placeholder="100\n50\n200")
+        create_submit = st.form_submit_button("Create")
+
+    if create_submit:
+        tickers = [t.strip().upper() for t in new_tickers.splitlines() if t.strip()]
+        try:
+            quantities = [float(q.strip()) for q in new_quantities.splitlines() if q.strip()]
+        except ValueError:
+            st.sidebar.error("Quantities must be numeric.")
+            return
+
+        if not new_name:
+            st.sidebar.error("Portfolio name is required.")
+        elif not tickers:
+            st.sidebar.error("At least one ticker is required.")
+        elif len(tickers) != len(quantities):
+            st.sidebar.error("Tickers and quantities must have the same count.")
+        else:
+            positions = [{"ticker": t, "quantity": q} for t, q in zip(tickers, quantities)]
+            try:
+                created = api_client.create_portfolio(token, new_name, new_value, positions)
+                st.sidebar.success(f"Created portfolio #{created['id']}")
+                st.session_state["selected_portfolio_id"] = created["id"]
+                st.rerun()
+            except APIError as e:
+                st.sidebar.error(str(e))
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("⚙️ Risk Settings")
+    period = st.sidebar.selectbox("Period", ["1mo", "3mo", "6mo", "1y", "2y"], index=3)
     confidence_levels = st.sidebar.multiselect(
         "VaR Confidence Levels",
         [0.90, 0.95, 0.99],
         default=[0.95, 0.99]
-    )
-    var_threshold_pct = st.sidebar.slider("VaR Alert Threshold (% of portfolio)", 1, 20, 5) / 100
-    corr_threshold = st.sidebar.slider("Correlation Alert Threshold", 0.50, 1.00, 0.80, 0.05)
-    conc_threshold = st.sidebar.slider("Concentration Alert Threshold (%)", 20, 80, 40) / 100
+    ) or [0.95]
 
-    return {
-        'input_mode': input_mode,
-        'market_type': market_type,
-        'period': period,
-        'portfolio_value_override': portfolio_value_override,
-        'confidence_levels': confidence_levels or [0.95],
-        'var_threshold_pct': var_threshold_pct,
-        'corr_threshold': corr_threshold,
-        'conc_threshold': conc_threshold
-    }
+    return {"period": period, "confidence_levels": confidence_levels}
 
 
-def build_positions(cfg: dict, universe: SymbolUniverse):
-    mode = cfg['input_mode']
-    market = cfg['market_type']
-    pm = PositionManager()
-    errors = []
+# --------------------------------------------------------------------------- #
+# Main dashboard
+# --------------------------------------------------------------------------- #
 
-    if mode == "Excel Upload":
-        st.info("📂 Upload an Excel file with columns: **Symbol** | **Quantity**")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            uploaded = st.file_uploader("Upload Portfolio Excel", type=['xlsx', 'xls'])
-        with col2:
-            st.download_button(
-                "⬇️ Download Template",
-                data=PositionManager.generate_excel_template(),
-                file_name="portfolio_template.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        if uploaded is None:
-            st.warning("Please upload your portfolio Excel file.")
-            return None, None
-
-        ok, msg, df = pm.from_excel(uploaded)
-        if not ok:
-            st.error(f"❌ {msg}")
-            return None, None
-        if msg != "OK":
-            st.warning(f"⚠️ {msg}")
-
-    elif mode == "Manual Selection":
-        market_key = 'tasi' if 'Saudi' in market else ('global' if market == 'Global' else 'all')
-        options = universe.get_display_options(market=market_key)
-
-        if not options:
-            st.warning("Symbol universe not loaded. Using free-text input.")
-            raw = st.text_area("Enter symbols (one per line)", "2222.SR\n1120.SR\n2010.SR", height=120)
-            symbols = [s.strip().upper() for s in raw.split('\n') if s.strip()]
-        else:
-            labels = list(options.keys())
-            selected_labels = st.multiselect(
-                "Select stocks from universe:",
-                labels,
-                default=labels[:5] if len(labels) >= 5 else labels
-            )
-            symbols = [options[l] for l in selected_labels]
-
-        if not symbols:
-            st.warning("Please select at least one stock.")
-            return None, None
-
-        st.markdown("#### Quantities (optional — leave 1 for equal weighting)")
-        qty_data = []
-        cols = st.columns(min(len(symbols), 5))
-        for i, sym in enumerate(symbols):
-            with cols[i % 5]:
-                qty = st.number_input(sym, min_value=1, value=100, step=10, key=f"qty_{sym}")
-                qty_data.append(qty)
-
-        ok, msg, df = pm.from_manual(symbols, qty_data)
-        if not ok:
-            st.error(f"❌ {msg}")
-            return None, None
-
-    else:
-        default_syms = ['2222.SR', '1120.SR', '2010.SR', '7010.SR', '1211.SR'] \
-            if 'Saudi' in market else ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA']
-        ok, msg, df = pm.from_manual(default_syms)
-        if not ok:
-            st.error(msg)
-            return None, None
-        st.info(f"🔖 Demo mode — using default symbols: {', '.join(default_syms)}")
-
-    with st.spinner("Fetching live prices..."):
-        positions_df, failed = pm.fetch_prices()
-
-    if failed:
-        st.warning(f"⚠️ Could not fetch prices for: {', '.join(failed)}. They will be excluded.")
-        pm.positions = pm.positions[~pm.positions['Symbol'].isin(failed)].reset_index(drop=True)
-        if pm.positions.empty:
-            st.error("No valid positions remain after price fetch.")
-            return None, None
-        total = pm.positions['Value'].sum()
-        pm.positions['Weight'] = pm.positions['Value'] / total
-
-    return pm, errors
-
-
-def main():
-    st.title("📊 Risk Management System (RMS)")
-    st.markdown("##### Professional Portfolio Risk Analysis — Saudi & Global Markets")
-    st.markdown("---")
-
-    cfg = render_sidebar()
-    universe = load_universe()
-
-    st.header("🗂️ Portfolio Input")
-    pm, _ = build_positions(cfg, universe)
-
-    if pm is None or pm.positions.empty:
+def render_portfolio_overview(portfolio: dict):
+    st.subheader("📋 Positions")
+    positions = portfolio.get("positions", [])
+    if not positions:
+        st.info("This portfolio has no positions yet.")
         return
 
-    tickers = pm.get_tickers()
-    weights = pm.get_weights()
-    portfolio_value = cfg['portfolio_value_override'] if cfg['portfolio_value_override'] > 0 else pm.get_portfolio_value()
-    if portfolio_value == 0:
-        portfolio_value = 1_000_000
+    df = pd.DataFrame(positions)
+    st.dataframe(df[["id", "ticker", "quantity"]], use_container_width=True)
 
-    val_engine = ValidationEngine(universe)
-    weights, w_msg = val_engine.validate_weights(weights)
-    if w_msg != "OK":
-        st.info(f"ℹ️ {w_msg}")
+    st.metric("Initial Value", _format_currency(portfolio.get("initial_value", 0)))
 
-    conc_alerts = val_engine.check_concentration(weights, tickers, cfg['conc_threshold'])
-    if conc_alerts:
-        for ca in conc_alerts:
-            st.warning(f"⚠️ {ca['message']}")
+    st.subheader("Add Position")
+    with st.form("add_position_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns([2, 2, 1])
+        with c1:
+            new_ticker = st.text_input("Ticker")
+        with c2:
+            new_qty = st.number_input("Quantity", min_value=0.0, value=100.0, step=1.0)
+        with c3:
+            submit = st.form_submit_button("Add")
+    if submit:
+        if not new_ticker:
+            st.error("Ticker is required.")
+        else:
+            try:
+                api_client.add_position(
+                    st.session_state["token"],
+                    portfolio["id"],
+                    new_ticker.strip().upper(),
+                    float(new_qty),
+                )
+                st.success("Position added.")
+                st.rerun()
+            except APIError as e:
+                st.error(str(e))
 
-    with st.expander("📋 Portfolio Positions", expanded=True):
-        st.dataframe(pm.get_summary_df(), use_container_width=True)
-        st.metric("Total Portfolio Value", format_currency(portfolio_value))
+    fig = go.Figure(data=[go.Pie(
+        labels=[p["ticker"] for p in positions],
+        values=[p["quantity"] for p in positions],
+        hole=0.4,
+        textinfo="label+percent",
+        marker=dict(colors=px.colors.qualitative.Set3),
+    )])
+    fig.update_layout(title="Quantity Allocation", height=380, margin=dict(t=40, b=20))
+    st.plotly_chart(fig, use_container_width=True)
 
-    with st.spinner("Loading historical market data..."):
-        try:
-            prices, returns, volume = load_market_data(tuple(tickers), cfg['period'])
-            valid_tickers = [t for t in tickers if t in prices.columns]
-            if not valid_tickers:
-                st.error("No historical data available for the selected symbols.")
+
+def render_risk_metrics(portfolio_id: int, cfg: dict):
+    token = st.session_state["token"]
+
+    if st.button("▶️ Run Risk Analysis", key="btn_risk"):
+        with st.spinner("Calling backend..."):
+            try:
+                result = api_client.calculate_risk(
+                    token,
+                    portfolio_id,
+                    period=cfg["period"],
+                    confidence_levels=cfg["confidence_levels"],
+                )
+                st.session_state["risk_result"] = result
+            except APIError as e:
+                st.error(str(e))
                 return
-            if len(valid_tickers) < len(tickers):
-                missing = [t for t in tickers if t not in valid_tickers]
-                st.warning(f"⚠️ No historical data for: {', '.join(missing)}")
-                prices = prices[valid_tickers]
-                returns = returns[valid_tickers]
-                tickers = valid_tickers
-                idx_map = {t: i for i, t in enumerate(pm.positions['Symbol'].tolist())}
-                keep_idx = [idx_map[t] for t in tickers if t in idx_map]
-                weights = weights[keep_idx]
-                weights = weights / weights.sum()
-        except Exception as e:
-            st.error(f"Error loading data: {str(e)}")
-            return
 
-    risk_engine = RiskEngine(returns, confidence_levels=cfg['confidence_levels'])
+    result = st.session_state.get("risk_result")
+    if not result or result.get("portfolio_id") != portfolio_id:
+        st.info("Click **Run Risk Analysis** to fetch metrics from the backend.")
+        return
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-        "📊 Overview", "📈 Risk Metrics", "🔮 Monte Carlo",
-        "🤖 ML Prediction", "🔔 Alerts", "💡 Recommendations", "📋 Reports"
+    c1, c2 = st.columns(2)
+    c1.metric("Annualized Volatility", _format_percentage(result["annualized_volatility"]))
+    c2.metric("Sharpe Ratio", f"{result['sharpe_ratio']:.4f}")
+
+    st.subheader("Value at Risk (VaR)")
+    rows = []
+    for conf in cfg["confidence_levels"]:
+        key = str(conf)
+        rows.append({
+            "Confidence": f"{conf * 100:.0f}%",
+            "Parametric VaR": _format_currency(result["parametric_var"].get(key, 0)),
+            "Historical VaR": _format_currency(result["historical_var"].get(key, 0)),
+            "CVaR (ES)": _format_currency(result["cvar"].get(key, 0)),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    st.caption(f"Analyzed tickers: {', '.join(result.get('tickers', []))}")
+
+
+def render_stress_test(portfolio_id: int, cfg: dict):
+    token = st.session_state["token"]
+
+    if st.button("▶️ Run Stress Test", key="btn_stress"):
+        with st.spinner("Running stress scenarios..."):
+            try:
+                result = api_client.stress_test(
+                    token,
+                    portfolio_id,
+                    period=cfg["period"],
+                    confidence_levels=cfg["confidence_levels"],
+                )
+                st.session_state["stress_result"] = result
+            except APIError as e:
+                st.error(str(e))
+                return
+
+    result = st.session_state.get("stress_result")
+    if not result:
+        st.info("Click **Run Stress Test** to simulate shock scenarios.")
+        return
+
+    rows = [
+        {
+            "Scenario": scenario.replace("_", " ").title(),
+            "Shocked Value": _format_currency(v["shocked_value"]),
+            "Loss": _format_currency(v["loss"]),
+            "Loss %": f"{v['loss_pct']:.2f}%",
+        }
+        for scenario, v in result.items()
+    ]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+
+def render_monte_carlo(portfolio_id: int, cfg: dict):
+    token = st.session_state["token"]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        n_sims = st.number_input("Simulations", 100, 50000, 1000, 100)
+    with c2:
+        horizon = st.number_input("Horizon (days)", 30, 1260, 252, 30)
+
+    if st.button("▶️ Run Monte Carlo", key="btn_mc"):
+        with st.spinner("Simulating..."):
+            try:
+                result = api_client.monte_carlo(
+                    token,
+                    portfolio_id,
+                    period=cfg["period"],
+                    confidence_levels=cfg["confidence_levels"],
+                    num_simulations=int(n_sims),
+                    time_horizon=int(horizon),
+                )
+                st.session_state["mc_result"] = result
+            except APIError as e:
+                st.error(str(e))
+                return
+
+    result = st.session_state.get("mc_result")
+    if not result:
+        st.info("Configure parameters and click **Run Monte Carlo**.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Mean Final Value", _format_currency(result["mean_final_value"]))
+    c2.metric("Std Deviation", _format_currency(result["std_final_value"]))
+    percentiles = result.get("percentiles", {})
+    c3.metric("5th Percentile", _format_currency(percentiles.get("5th", 0)))
+
+    st.subheader("Percentile Summary")
+    pct_rows = [{"Percentile": k, "Value": _format_currency(v)} for k, v in percentiles.items()]
+    st.dataframe(pd.DataFrame(pct_rows), use_container_width=True)
+
+    st.subheader("Monte Carlo VaR")
+    mc_var = result.get("mc_var", {})
+    var_rows = [{"Confidence": f"{float(k) * 100:.0f}%", "VaR": _format_currency(v)} for k, v in mc_var.items()]
+    st.dataframe(pd.DataFrame(var_rows), use_container_width=True)
+
+
+def render_dashboard():
+    cfg = render_sidebar()
+    if cfg is None:
+        return
+
+    st.title("📊 Risk Management System (RMS)")
+    st.caption("API-driven dashboard — all data served by FastAPI backend")
+    st.markdown("---")
+
+    portfolio_id = st.session_state.get("selected_portfolio_id")
+    if not portfolio_id:
+        st.info("👈 Create or select a portfolio from the sidebar to begin.")
+        return
+
+    try:
+        portfolio = api_client.get_portfolio(st.session_state["token"], portfolio_id)
+    except APIError as e:
+        st.error(str(e))
+        return
+
+    st.header(f"Portfolio: {portfolio['name']}")
+
+    col_del1, _ = st.columns([1, 5])
+    with col_del1:
+        if st.button("🗑️ Delete Portfolio"):
+            try:
+                api_client.delete_portfolio(st.session_state["token"], portfolio_id)
+                st.session_state["selected_portfolio_id"] = None
+                st.session_state.pop("risk_result", None)
+                st.session_state.pop("stress_result", None)
+                st.session_state.pop("mc_result", None)
+                st.success("Portfolio deleted.")
+                st.rerun()
+            except APIError as e:
+                st.error(str(e))
+
+    tab_overview, tab_risk, tab_stress, tab_mc = st.tabs([
+        "📊 Overview", "📈 Risk Metrics", "💥 Stress Test", "🔮 Monte Carlo"
     ])
 
-    corr_matrix = risk_engine.calculate_correlation_matrix()
-    returns_stats = risk_engine.calculate_returns_stats()
-    ann_vol = float((returns * weights).sum(axis=1).std() * np.sqrt(252))
-    sharpe = risk_engine.calculate_sharpe_ratio(weights)
-    sortino = risk_engine.calculate_sortino_ratio(weights)
-    max_dd_result = risk_engine.calculate_maximum_drawdown(prices)
-    max_dd = float(max_dd_result['portfolio'])
-    var_param = risk_engine.calculate_parametric_var(portfolio_value, weights)
-    var_hist = risk_engine.calculate_historical_var(portfolio_value, weights)
-    cvar = risk_engine.calculate_cvar(portfolio_value, weights)
-    primary_conf = cfg['confidence_levels'][0]
+    with tab_overview:
+        render_portfolio_overview(portfolio)
 
-    alerts_engine = AlertsEngine(
-        var_threshold_pct=cfg['var_threshold_pct'],
-        correlation_threshold=cfg['corr_threshold'],
-        concentration_threshold=cfg['conc_threshold']
-    )
-    alerts = alerts_engine.run_all_checks(
-        var_value=var_hist[primary_conf],
-        portfolio_value=portfolio_value,
-        corr_matrix=corr_matrix,
-        weights=weights,
-        symbols=tickers,
-        ann_volatility=ann_vol,
-        max_drawdown=max_dd
-    )
-    sev_counts = alerts_engine.get_severity_count()
+    with tab_risk:
+        render_risk_metrics(portfolio_id, cfg)
 
-    rec_engine = RecommendationEngine()
-    recommendations = rec_engine.analyze(
-        weights=weights,
-        symbols=tickers,
-        corr_matrix=corr_matrix,
-        ann_volatility=ann_vol,
-        sharpe_ratio=sharpe,
-        max_drawdown=max_dd,
-        var_pct=var_hist[primary_conf] / portfolio_value
-    )
+    with tab_stress:
+        render_stress_test(portfolio_id, cfg)
 
-    with tab1:
-        st.header("Portfolio Overview")
-
-        c1, c2, c3, c4, c5 = st.columns(5)
-        perf = (returns * weights).sum(axis=1)
-        total_ret = float((1 + perf).prod() - 1)
-
-        alert_badge = ""
-        if sev_counts['HIGH'] > 0:
-            alert_badge = f" 🔴 {sev_counts['HIGH']} High"
-        if sev_counts['MEDIUM'] > 0:
-            alert_badge += f" 🟡 {sev_counts['MEDIUM']} Medium"
-
-        c1.metric("Portfolio Value", format_currency(portfolio_value))
-        c2.metric("Total Return", format_percentage(total_ret))
-        c3.metric("Sharpe Ratio", f"{sharpe:.3f}")
-        c4.metric("Ann. Volatility", format_percentage(ann_vol))
-        c5.metric("Active Alerts", f"{len(alerts)}{alert_badge}")
-
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.subheader("Asset Allocation")
-            fig_pie = go.Figure(data=[go.Pie(
-                labels=tickers,
-                values=weights,
-                hole=0.4,
-                textinfo='label+percent',
-                marker=dict(colors=px.colors.qualitative.Set3)
-            )])
-            fig_pie.update_layout(height=380, margin=dict(t=20, b=20))
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-        with col_b:
-            st.subheader("Cumulative Returns")
-            cum = (1 + returns).cumprod()
-            port_cum = (1 + perf).cumprod()
-            fig_cum = go.Figure()
-            for t in tickers:
-                fig_cum.add_trace(go.Scatter(x=cum.index, y=cum[t], name=t, mode='lines', opacity=0.6))
-            fig_cum.add_trace(go.Scatter(
-                x=port_cum.index, y=port_cum,
-                name='Portfolio', mode='lines',
-                line=dict(width=3, color='black', dash='dash')
-            ))
-            fig_cum.update_layout(height=380, hovermode='x unified', margin=dict(t=20, b=20))
-            st.plotly_chart(fig_cum, use_container_width=True)
-
-    with tab2:
-        st.header("Risk Metrics")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Correlation Matrix")
-            fig_corr = px.imshow(
-                corr_matrix, text_auto='.2f',
-                color_continuous_scale='RdBu_r', zmin=-1, zmax=1, aspect='auto'
-            )
-            fig_corr.update_layout(height=420)
-            st.plotly_chart(fig_corr, use_container_width=True)
-
-        with col2:
-            st.subheader("EWMA Volatility (Annualized)")
-            ewma_vol = risk_engine.calculate_ewma_volatility(span=30)
-            fig_vol = go.Figure()
-            for t in tickers:
-                fig_vol.add_trace(go.Scatter(x=ewma_vol.index, y=ewma_vol[t], name=t, mode='lines'))
-            fig_vol.update_layout(height=420, hovermode='x unified')
-            st.plotly_chart(fig_vol, use_container_width=True)
-
-        st.subheader("Value at Risk (VaR) Summary")
-        var_rows = []
-        for conf in cfg['confidence_levels']:
-            var_rows.append({
-                'Confidence': f"{conf*100:.0f}%",
-                'Parametric VaR': format_currency(var_param[conf]),
-                'Historical VaR': format_currency(var_hist[conf]),
-                'CVaR (ES)': format_currency(cvar[conf]),
-                '% of Portfolio': f"{var_hist[conf]/portfolio_value*100:.2f}%"
-            })
-        st.dataframe(pd.DataFrame(var_rows), use_container_width=True)
-
-        st.subheader("Stress Test Scenarios")
-        stress = risk_engine.stress_test(portfolio_value, weights)
-        stress_rows = [{
-            'Scenario': k.replace('_', ' ').title(),
-            'Shocked Value': format_currency(v['shocked_value']),
-            'Loss': format_currency(v['loss']),
-            'Loss %': f"{v['loss_percentage']:.1f}%"
-        } for k, v in stress.items()]
-        st.dataframe(pd.DataFrame(stress_rows), use_container_width=True)
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Sharpe Ratio", f"{sharpe:.4f}")
-        c2.metric("Sortino Ratio", f"{sortino:.4f}")
-        c3.metric("Max Drawdown", format_percentage(max_dd))
-
-    with tab3:
-        st.header("Monte Carlo Simulation")
-        c1, c2 = st.columns(2)
-        with c1:
-            n_sims = st.number_input("Simulations", 1000, 50000, 10000, 1000)
-        with c2:
-            horizon = st.number_input("Horizon (days)", 30, 1260, 252, 30)
-
-        if st.button("▶️ Run Monte Carlo"):
-            with st.spinner("Simulating..."):
-                mc = risk_engine.monte_carlo_simulation(portfolio_value, weights, int(n_sims), int(horizon))
-
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Mean Final Value", format_currency(mc['mean_final_value']))
-            c2.metric("5th Percentile", format_currency(mc['percentiles']['5th']))
-            c3.metric("95th Percentile", format_currency(mc['percentiles']['95th']))
-
-            fig_mc = go.Figure()
-            for i in range(min(200, int(n_sims))):
-                fig_mc.add_trace(go.Scatter(
-                    y=mc['simulated_paths'][i] * portfolio_value,
-                    mode='lines', line=dict(width=0.4),
-                    opacity=0.15, showlegend=False, hoverinfo='skip'
-                ))
-            mean_path = mc['simulated_paths'].mean(axis=0) * portfolio_value
-            fig_mc.add_trace(go.Scatter(
-                y=mean_path, name='Mean', mode='lines',
-                line=dict(color='red', width=2.5)
-            ))
-            fig_mc.add_hline(y=portfolio_value, line_dash='dash', line_color='gray',
-                             annotation_text='Initial Value')
-            fig_mc.update_layout(
-                title=f"Monte Carlo — {n_sims:,} Paths × {horizon} Days",
-                xaxis_title="Days", yaxis_title="Portfolio Value ($)",
-                height=520
-            )
-            st.plotly_chart(fig_mc, use_container_width=True)
-
-            fig_hist = px.histogram(mc['final_values'], nbins=60, title="Distribution of Final Values")
-            fig_hist.add_vline(x=portfolio_value, line_dash='dash', line_color='red',
-                               annotation_text='Initial')
-            fig_hist.update_layout(height=350)
-            st.plotly_chart(fig_hist, use_container_width=True)
-
-    with tab4:
-        st.header("ML Risk Prediction")
-        c1, c2 = st.columns(2)
-        with c1:
-            ml_model_type = st.selectbox("Model", ['Random Forest', 'XGBoost'])
-        with c2:
-            test_size = st.slider("Test Split (%)", 10, 40, 20) / 100
-
-        if st.button("🚀 Train Model"):
-            with st.spinner("Training..."):
-                try:
-                    predictor = RiskPredictor(model_type='classification')
-                    features = predictor.prepare_features(returns, prices, volume if not volume.empty else None)
-                    target = predictor.create_target_classification(returns, weights)
-                    results = predictor.train_model(
-                        features, target, test_size=test_size,
-                        use_xgboost=(ml_model_type == 'XGBoost')
-                    )
-                    st.session_state['ml_predictor'] = predictor
-                    st.session_state['ml_results'] = results
-                    st.success("✅ Model trained")
-
-                    c1, c2 = st.columns(2)
-                    c1.metric("Train Accuracy", f"{results['train_accuracy']:.4f}")
-                    c2.metric("Test Accuracy", f"{results['test_accuracy']:.4f}")
-
-                    fi = results['feature_importance'].head(15)
-                    fig_fi = go.Figure(go.Bar(
-                        x=fi['importance'], y=fi['feature'],
-                        orientation='h', marker_color='steelblue'
-                    ))
-                    fig_fi.update_layout(
-                        title="Top Feature Importances",
-                        yaxis={'categoryorder': 'total ascending'}, height=450
-                    )
-                    st.plotly_chart(fig_fi, use_container_width=True)
-
-                except Exception as e:
-                    st.error(f"Training failed: {str(e)}")
-
-        if 'ml_predictor' in st.session_state:
-            try:
-                predictor = st.session_state['ml_predictor']
-                features = predictor.prepare_features(returns, prices, volume if not volume.empty else None)
-                risk_level = predictor.predict_risk_level(features.iloc[-1:])[0]
-                color = {'LOW': '🟢', 'MEDIUM': '🟡', 'HIGH': '🔴'}.get(risk_level, '⚪')
-                st.markdown(f"### Current Risk Level: {color} **{risk_level}**")
-
-                alerts_engine.check_ml_signal(risk_level)
-            except Exception as e:
-                st.warning(f"Prediction unavailable: {str(e)}")
-
-    with tab5:
-        st.header("🔔 Risk Alerts")
-
-        if not alerts:
-            st.success("✅ No active alerts — portfolio risk is within acceptable thresholds.")
-        else:
-            h = sev_counts['HIGH']
-            m = sev_counts['MEDIUM']
-            c1, c2, c3 = st.columns(3)
-            c1.metric("🔴 High Alerts", h)
-            c2.metric("🟡 Medium Alerts", m)
-            c3.metric("Total Alerts", len(alerts))
-
-            st.markdown("---")
-            for alert in alerts:
-                sev = alert['severity']
-                css = 'alert-high' if sev == 'HIGH' else ('alert-medium' if sev == 'MEDIUM' else 'alert-low')
-                icon = '🔴' if sev == 'HIGH' else ('🟡' if sev == 'MEDIUM' else '🟢')
-                st.markdown(
-                    f'<div class="{css}">'
-                    f'<strong>{icon} [{sev}] {alert["type"]}</strong><br>'
-                    f'{alert["message"]}<br>'
-                    f'<small>{alert["detail"]}</small>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
-
-    with tab6:
-        st.header("💡 Recommendations")
-
-        if not recommendations:
-            st.info("No recommendations at this time.")
-        else:
-            for rec in recommendations:
-                pri = rec['priority']
-                css = 'rec-high' if pri == 'HIGH' else ('rec-medium' if pri == 'MEDIUM' else 'rec-low')
-                icon = '🔴' if pri == 'HIGH' else ('🔵' if pri == 'MEDIUM' else '🟢')
-                st.markdown(
-                    f'<div class="{css}">'
-                    f'<strong>{icon} {rec["category"]}</strong><br>'
-                    f'{rec["message"]}<br>'
-                    f'<em>→ {rec["action"]}</em>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
-
-    with tab7:
-        st.header("📋 Risk Report")
-
-        report_rows = [
-            {'Metric': 'Portfolio Value', 'Value': format_currency(portfolio_value)},
-            {'Metric': 'Total Return', 'Value': format_percentage(total_ret)},
-            {'Metric': 'Annualized Return', 'Value': format_percentage(float((returns * weights).sum(axis=1).mean() * 252))},
-            {'Metric': 'Annualized Volatility', 'Value': format_percentage(ann_vol)},
-            {'Metric': 'Sharpe Ratio', 'Value': f"{sharpe:.4f}"},
-            {'Metric': 'Sortino Ratio', 'Value': f"{sortino:.4f}"},
-            {'Metric': 'Maximum Drawdown', 'Value': format_percentage(max_dd)},
-            {'Metric': 'Active Alerts', 'Value': str(len(alerts))},
-        ]
-        for conf in cfg['confidence_levels']:
-            report_rows.append({'Metric': f'Historical VaR ({conf*100:.0f}%)', 'Value': format_currency(var_hist[conf])})
-            report_rows.append({'Metric': f'CVaR ({conf*100:.0f}%)', 'Value': format_currency(cvar[conf])})
-
-        st.dataframe(pd.DataFrame(report_rows), use_container_width=True)
-
-        col1, col2 = st.columns(2)
-        with col1:
-            positions_csv = pm.positions.to_csv(index=False).encode()
-            st.download_button("⬇️ Export Positions CSV", positions_csv, "positions.csv", "text/csv")
-        with col2:
-            alerts_df = alerts_engine.get_alerts_df()
-            if not alerts_df.empty:
-                alerts_csv = alerts_df.to_csv(index=False).encode()
-                st.download_button("⬇️ Export Alerts CSV", alerts_csv, "alerts.csv", "text/csv")
+    with tab_mc:
+        render_monte_carlo(portfolio_id, cfg)
 
     st.sidebar.markdown("---")
-    st.sidebar.info("**RMS v2.0** — Professional Risk Management System\n\n© 2026")
+    st.sidebar.caption("**RMS v2.0** — SaaS Edition © 2026")
+
+
+# --------------------------------------------------------------------------- #
+# Entrypoint
+# --------------------------------------------------------------------------- #
+
+def main():
+    _init_session()
+
+    if not _is_logged_in():
+        render_auth_screen()
+        return
+
+    render_dashboard()
 
 
 if __name__ == "__main__":

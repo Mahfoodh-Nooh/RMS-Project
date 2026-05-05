@@ -123,8 +123,8 @@
 ### 7. الدعم الفني
 
 للأسئلة أو المشاكل:
-- GitHub Issues: [الرابط]
-- Email: [بريدك]
+- GitHub Issues: [قريبا]
+- Email: [mahfoodhnooh@gmail.com]
 
 ---
 

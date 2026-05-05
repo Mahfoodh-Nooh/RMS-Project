@@ -1,13 +1,21 @@
+# Backend
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+sqlalchemy>=2.0.0
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+pydantic[email]>=2.0.0
+
+# Data & ML
 numpy
 pandas
 yfinance
 scikit-learn
 xgboost
-streamlit
-plotly
-matplotlib
-seaborn
 scipy
-openpyxl
-ta
 joblib
+
+# Frontend
+streamlit>=1.35.0
+plotly>=5.18.0
+requests>=2.31.0
