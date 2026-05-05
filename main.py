@@ -16,7 +16,7 @@ data = data["Close"]
 returns = data.pct_change().dropna()
 
 # تشغيل المحرك
-engine = RiskEngine(returns, weights)
+engine = RiskEngine(returns, w  eights)
 
 # ✅ اطبع فقط الموجود فعليًا
 print("VaR:", engine.parametric_var())
