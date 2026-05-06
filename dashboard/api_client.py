@@ -228,7 +228,8 @@ def monte_carlo(
 
 def health_check() -> bool:
     try:
-        response = requests.get("http://127.0.0.1:8000/", timeout=5)
+        base = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
+        response = requests.get(f"{base}/", timeout=5)
         return response.ok
     except requests.RequestException:
         return False
